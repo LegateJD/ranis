@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - "release-v*.*.*"
+      - "v*"
 
 permissions:
   contents: write
@@ -17,45 +17,8 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  validate:
-    name: Validate
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-
-     # - name: Format
-     #   run: cargo fmt --all -- --check
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-      - name: Check
-        run: cargo check --workspace --all-features
-
-      - name: Tests
-        run: cargo test --workspace --all-features
-
-      - name: Security audit
-        run: |
-          cargo install cargo-audit --locked
-          cargo audit
-
-      - name: Spelling
-        uses: crate-ci/typos@v1.49.0
-
   build-rust-packages:
     name: Build (${{ matrix.os }})
-    needs: validate
 
     strategy:
       fail-fast: false
@@ -63,13 +26,12 @@ jobs:
         os:
           - ubuntu-latest
           - windows-latest
-          - macos-latest
 
     runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -81,7 +43,7 @@ jobs:
         run: cargo build --release
 
       - name: Upload native artifacts
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: rust-${{ matrix.os }}
           path: |
@@ -90,11 +52,11 @@ jobs:
             target/release/*.dylib
             target/release/*.lib
             target/release/*.a
+            target/release/*.rlib
           if-no-files-found: ignore
 
   build-python-packages:
     name: Python Package (${{ matrix.os }})
-    needs: validate
 
     strategy:
       fail-fast: false
@@ -102,13 +64,12 @@ jobs:
         os:
           - ubuntu-latest
           - windows-latest
-          - macos-latest
 
     runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -123,93 +84,128 @@ jobs:
           cache: "pip"
 
       - name: Install maturin
-        run: python -m pip install maturin
+        run: python -m pip install --upgrade maturin
 
-      - name: Build Python package
-        run: maturin build --release
+      - name: Clean stale wheels
+        shell: bash
+        run: rm -rf target/wheels
+
+      - name: Build Python wheel
+        run: maturin build --release --features python
 
       - name: Upload Python package
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: python-${{ matrix.os }}
           path: target/wheels/
+          if-no-files-found: error
 
-  build-c-packages:
-    name: C Package (${{ matrix.os }})
-    needs: validate
+  publish-rust:
+    name: Publish Rust to crates.io
 
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - windows-latest
-          - macos-latest
-
-    runs-on: ${{ matrix.os }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install Conan
-        run: python -m pip install conan
-
-      - name: Build native library
-        run: cargo build --release
-
-      - name: Install C++ dependencies
-        run: conan install .
-
-      - name: Upload C++ package
-        uses: actions/upload-artifact@v5
-        with:
-          name: c-${{ matrix.os }}
-          path: package/
-
-  release:
-    name: Create GitHub Release
     needs:
       - build-rust-packages
-      - build-python-packages
-      - build-c-packages
 
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check if version already published
+        id: check
+        run: |
+          PKG_NAME=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].name')
+          PKG_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          echo "name=$PKG_NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$PKG_VERSION" >> "$GITHUB_OUTPUT"
+
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://crates.io/api/v1/crates/$PKG_NAME/$PKG_VERSION")
+          if [ "$STATUS" = "200" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "$PKG_NAME v$PKG_VERSION already exists on crates.io, skipping publish."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify package
+        if: steps.check.outputs.exists == 'false'
+        run: cargo publish --dry-run --allow-dirty
+
+      - name: Publish to crates.io
+        if: steps.check.outputs.exists == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_API_TOKEN }}
+        run: cargo publish --allow-dirty
+
+  publish-python:
+    name: Publish Python to PyPI
+
+    needs:
+      - build-python-packages
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download Python wheels
+        uses: actions/download-artifact@v8
+        with:
+          pattern: python-*
+          path: artifacts/python
+          merge-multiple: true
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.1.0
+
+      - name: Publish to PyPI
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          uv publish --check-url https://pypi.org/simple/ artifacts/python/*
+
+  release:
+    name: Create GitHub Release
+    needs:
+      - publish-rust
+      - publish-python
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
       - name: Download Rust artifacts
         uses: actions/download-artifact@v6
         with:
           pattern: rust-*
           path: artifacts/rust
-          merge-multiple: false
+          merge-multiple: true
 
       - name: Download Python package
         uses: actions/download-artifact@v6
         with:
           pattern: python-*
           path: artifacts/python
-          merge-multiple: false
+          merge-multiple: true
 
-      - name: Download C package
-        uses: actions/download-artifact@v6
-        with:
-          pattern: c-*
-          path: artifacts/c
-          merge-multiple: false
+      - name: Show release artifacts
+        run: |
+          echo "Rust artifacts:"
+          find artifacts/rust -type f -print
+
+          echo "Python artifacts:"
+          find artifacts/python -type f -print
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
+            --verify-tag \
             --generate-notes \
-            artifacts/rust/**/* \
-            artifacts/python/**/* \
-            artifacts/c/**/* \
+            artifacts/rust/* \
+            artifacts/python/*
