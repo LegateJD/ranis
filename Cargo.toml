@@ -1,6 +1,6 @@
 [package]
 name = "ranis"
-version = "0.1.2"
+version = "0.1.0"
 edition = "2021"
 
 description = "Ranis is a collection of polymorphic shellcode encoders for **offensive security operations** and **penetration testing**. Encoders obfuscate a raw payload by wrapping it in a self-decoding stub, so its bytes no longer match static signatures used by antivirus/EDR products, while remaining fully functional at runtime. Multiple stages can be chained together, each one re-encoding the previous stage's output, and every encoder can be constrained to avoid a configurable set of bad characters (e.g. `0x00`, `0x0a`, `0x0d`) that would otherwise break delivery through the target's input path."
