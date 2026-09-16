@@ -6,11 +6,7 @@ on:
       - "v*"
 
 permissions:
-  contents: write
-
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: true
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,14 +14,20 @@ env:
 
 jobs:
   build-rust-packages:
-    name: Build (${{ matrix.os }})
+    name: Build Rust (${{ matrix.plat }} ${{ matrix.arch }})
 
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - windows-latest
+        include:
+          - os: ubuntu-latest
+            plat: linux
+            arch: x64
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            plat: windows
+            arch: x64
+            target: x86_64-pc-windows-msvc
 
     runs-on: ${{ matrix.os }}
 
@@ -35,35 +37,51 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install 32-bit build deps (Linux x86)
+        if: matrix.target == 'i686-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-multilib
 
       - name: Build release
-        run: cargo build --release
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Upload native artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: rust-${{ matrix.os }}
+          name: rust-${{ matrix.plat }}-${{ matrix.arch }}
           path: |
-            target/release/*.dll
-            target/release/*.so
-            target/release/*.dylib
-            target/release/*.lib
-            target/release/*.a
-            target/release/*.rlib
+            target/${{ matrix.target }}/release/ranis
+            target/${{ matrix.target }}/release/ranis.exe
+            target/${{ matrix.target }}/release/*.dll
+            target/${{ matrix.target }}/release/*.so
+            target/${{ matrix.target }}/release/*.dylib
+            target/${{ matrix.target }}/release/*.lib
+            target/${{ matrix.target }}/release/*.a
+            target/${{ matrix.target }}/release/*.rlib
           if-no-files-found: ignore
 
   build-python-packages:
-    name: Python Package (${{ matrix.os }})
+    name: Python Package (${{ matrix.plat }} ${{ matrix.arch }})
 
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - windows-latest
+        include:
+          - os: ubuntu-latest
+            plat: linux
+            arch: x64
+            target: x86_64
+          - os: windows-latest
+            plat: windows
+            arch: x64
+            target: x64
 
     runs-on: ${{ matrix.os }}
 
@@ -71,33 +89,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-
       - name: Install Python
+        if: runner.os == 'Windows'
         uses: actions/setup-python@v6
         with:
-          python-version: "3.x"
-          cache: "pip"
+          python-version: "3.14"
+          architecture: ${{ matrix.target }}
 
-      - name: Install maturin
-        run: python -m pip install --upgrade maturin
-
-      - name: Clean stale wheels
-        shell: bash
-        run: rm -rf target/wheels
-
-      - name: Build Python wheel
-        run: maturin build --release --features python
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: auto
+          args: --release --out dist --features python -i python3.14
 
       - name: Upload Python package
         uses: actions/upload-artifact@v7
         with:
-          name: python-${{ matrix.os }}
-          path: target/wheels/
+          name: python-${{ matrix.plat }}-${{ matrix.arch }}
+          path: dist
           if-no-files-found: error
 
   publish-rust:
@@ -115,31 +125,47 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Check if version already published
+      - name: Check if version already published #Support check if package exists in crates.io
         id: check
+        shell: bash
+        env:
+          PKG_NAME: ${{ needs.check-version.outputs.name }}
+          PKG_VERSION: ${{ needs.check-version.outputs.version }}
         run: |
-          PKG_NAME=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].name')
-          PKG_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
-          echo "name=$PKG_NAME" >> "$GITHUB_OUTPUT"
-          echo "version=$PKG_VERSION" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
 
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://crates.io/api/v1/crates/$PKG_NAME/$PKG_VERSION")
-          if [ "$STATUS" = "200" ]; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "$PKG_NAME v$PKG_VERSION already exists on crates.io, skipping publish."
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
+          STATUS="$(
+            curl -sS -o /dev/null -w "%{http_code}" --retry 3 \
+              -A "${GITHUB_REPOSITORY} release workflow (https://github.com/${GITHUB_REPOSITORY})" \
+              "https://crates.io/api/v1/crates/${PKG_NAME}/${PKG_VERSION}"
+          )"
+
+          echo "crates.io HTTP status: ${STATUS}"
+
+          case "$STATUS" in
+            200)
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              echo "::notice::${PKG_NAME}@${PKG_VERSION} is already on crates.io; skipping publish."
+              ;;
+            404)
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+              echo "${PKG_NAME}@${PKG_VERSION} is not on crates.io yet; publishing."
+              ;;
+            *)
+              echo "::error::Unexpected crates.io response: HTTP ${STATUS}"
+              exit 1
+              ;;
+          esac
 
       - name: Verify package
         if: steps.check.outputs.exists == 'false'
-        run: cargo publish --dry-run --allow-dirty
+        run: cargo publish --dry-run
 
       - name: Publish to crates.io
         if: steps.check.outputs.exists == 'false'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_API_TOKEN }}
-        run: cargo publish --allow-dirty
+        run: cargo publish
 
   publish-python:
     name: Publish Python to PyPI
@@ -160,17 +186,42 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v10.1.0
 
-      - name: Publish to PyPI
+      # Remove after 0.1.0 and 0.1.2
+      - name: Add wheel build tag
+        run: uvx wheel tags --build=2 --remove artifacts/python/*.whl
+
+      - name: Show wheels
+        run: ls -la artifacts/python
+
+      - name: Publish to PyPI #https://github.com/astral-sh/uv/issues/7917?timeline_page=1
+        shell: bash
         env:
           UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
         run: |
-          uv publish --check-url https://pypi.org/simple/ artifacts/python/*
+          set +e
+          out="$(uv publish --check-url https://pypi.org/simple/ artifacts/python/* 2>&1)"
+          code=$?
+          echo "$out"
 
-  release:
-    name: Create GitHub Release
+          if [[ $code -eq 0 ]]; then
+            exit 0
+          fi
+
+          # Known-benign: the file(s) already exist on PyPI under this version.
+          if grep -qiE 'already exists|previously used|do not match for|file name reuse|filename has already been used' <<< "$out"; then
+            echo "::notice::Files already published to PyPI for this version; treating as success."
+            exit 0
+          fi
+
+          echo "::error::uv publish failed for a reason other than existing files."
+          exit $code
+
+  package:
+    name: Package per-platform archives
+
     needs:
-      - publish-rust
-      - publish-python
+      - build-rust-packages
+      - build-python-packages
 
     runs-on: ubuntu-latest
 
@@ -178,34 +229,95 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Download Rust artifacts
-        uses: actions/download-artifact@v6
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v8
         with:
-          pattern: rust-*
-          path: artifacts/rust
-          merge-multiple: true
+          path: staging
 
-      - name: Download Python package
-        uses: actions/download-artifact@v6
+      - name: Build archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          NAME="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["name"])')"
+          VERSION="${GITHUB_REF_NAME#v}"
+          OUT="$GITHUB_WORKSPACE/archives"
+          mkdir -p "$OUT"
+          echo "Packaging ${NAME} ${VERSION}"
+
+          # archive <out-basename> <plat> <src-dir...>  -> .zip on windows, else .tar.gz
+          archive() {
+            local base="$1" plat="$2"; shift 2
+            local tmp; tmp="$(mktemp -d)"
+            local found=0
+            for d in "$@"; do
+              if [ -d "$d" ] && [ -n "$(ls -A "$d" 2>/dev/null)" ]; then
+                cp -a "$d"/. "$tmp"/; found=1
+              fi
+            done
+            if [ "$found" -eq 0 ]; then
+              echo "::notice::No input for ${base}; skipping (build may have failed)."
+              return 0
+            fi
+            if [ "$plat" = "windows" ]; then
+              ( cd "$tmp" && zip -j -q -r "$OUT/${base}.zip" . )
+              echo "Created ${base}.zip"
+            else
+              tar -czf "$OUT/${base}.tar.gz" -C "$tmp" .
+              echo "Created ${base}.tar.gz"
+            fi
+          }
+
+          for plat in linux windows; do
+            for arch in x64 x86; do
+              rustdir="staging/rust-${plat}-${arch}"
+              pydir="staging/python-${plat}-${arch}"
+
+              archive "${NAME}_rust_${plat}_${arch}_${VERSION}"   "$plat" "$rustdir"
+              archive "${NAME}_python_${plat}_${arch}_${VERSION}" "$plat" "$pydir" "$rustdir"
+            done
+          done
+
+          echo "All archives:"
+          ls -la "$OUT"
+
+      - name: Upload archives
+        uses: actions/upload-artifact@v7
         with:
-          pattern: python-*
-          path: artifacts/python
-          merge-multiple: true
+          name: release-archives
+          path: archives/
+          if-no-files-found: error
 
-      - name: Show release artifacts
-        run: |
-          echo "Rust artifacts:"
-          find artifacts/rust -type f -print
+  release:
+    name: Create GitHub Release
 
-          echo "Python artifacts:"
-          find artifacts/python -type f -print
+    needs:
+      - publish-rust
+      - publish-python
+      - package
 
-      - name: Create GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            --verify-tag \
-            --generate-notes \
-            artifacts/rust/* \
-            artifacts/python/*
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download archives
+        uses: actions/download-artifact@v8
+        with:
+          name: release-archives
+          path: dist
+
+      - name: Show release assets
+        run: ls -la dist
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
